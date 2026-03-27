@@ -19,27 +19,34 @@ LATEST_PATH = os.path.join(SITE_DIR, "latest.html")
 
 # --- Feeds ---
 # Keep these curated + mostly RSS to avoid brittle scraping.
+# Each feed supports fallback URLs (first working URL wins).
 FEEDS = {
     "Startup / Venture + AI": [
-        ("TechCrunch — AI", "https://techcrunch.com/tag/artificial-intelligence/feed/"),
-        ("VentureBeat — AI", "https://venturebeat.com/category/ai/feed/"),
+        ("TechCrunch — AI", ["https://techcrunch.com/tag/artificial-intelligence/feed/"]),
+        ("VentureBeat — AI", ["https://venturebeat.com/category/ai/feed/"]),
     ],
     "Big Tech + AI": [
-        ("The Verge — AI", "https://www.theverge.com/artificial-intelligence/rss/index.xml"),
-        ("Google Research", "https://research.google/blog/rss/"),
-        ("Google Blog (all)", "https://blog.google/rss"),
-        ("MIT Technology Review — AI", "https://www.technologyreview.com/topic/artificial-intelligence/feed/"),
+        # The old /artificial-intelligence/rss URL started returning 404.
+        ("The Verge — AI", ["https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"]),
+        ("Google Research", ["https://research.google/blog/rss/"]),
+        ("Google Blog (all)", ["https://blog.google/rss"]),
+        ("MIT Technology Review — AI", ["https://www.technologyreview.com/topic/artificial-intelligence/feed/"]),
     ],
     "Influencers / Pods / Newsletters": [
-        ("Alex Finn (Substack)", "https://alexfinnofficial.substack.com/feed"),
-        ("The Moonshot Podcast (X / Astro Teller)", "https://feeds.megaphone.fm/moonshot"),
-        ("The Salim Ismail Podcast", "https://feeds.buzzsprout.com/2179612.rss"),
+        # Substack user profiles often redirect to HTML; use the publication feed.
+        ("Alex Finn", ["https://alexfinn.substack.com/feed", "https://www.alexfinn.ai/feed"]),
+        ("The Moonshot Podcast (X / Astro Teller)", ["https://feeds.megaphone.fm/moonshot"]),
+        ("The Salim Ismail Podcast", ["https://feeds.buzzsprout.com/2114080.rss"]),
     ],
 }
 
 USER_AGENT = "OpenClaw Daily AI Report (+local script)"
 TIMEOUT_S = 20
 MAX_ITEMS_PER_FEED = 6
+
+# Default truncation for summaries. Some sources (podcasts/newsletters) benefit from longer text.
+DEFAULT_SUMMARY_CHARS = 240
+LONG_SUMMARY_CHARS = 600
 
 
 def _clean_html_to_text(s: str) -> str:
@@ -60,9 +67,33 @@ def _domain(url: str) -> str:
 
 def _fetch_feed(url: str):
     # feedparser can fetch itself, but we fetch with requests so we can set headers/timeouts.
-    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT_S)
+    # Some sites return HTML if they think you're a browser; we treat that as failure.
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.1",
+    }
+    r = requests.get(url, headers=headers, timeout=TIMEOUT_S, allow_redirects=True)
     r.raise_for_status()
+    ct = (r.headers.get("content-type") or "").lower()
+    if "html" in ct and "xml" not in ct:
+        raise ValueError(f"Expected RSS/XML but got content-type={ct}")
     return feedparser.parse(r.content)
+
+
+def _fetch_feed_with_fallback(urls):
+    last_err = None
+    for u in urls:
+        try:
+            parsed = _fetch_feed(u)
+            entries = getattr(parsed, "entries", []) or []
+            if entries:
+                return parsed, u, None
+            # Some feeds parse but come back empty; keep trying fallbacks.
+            last_err = ValueError("Parsed feed but had 0 entries")
+        except Exception as ex:
+            last_err = ex
+            continue
+    return None, None, last_err
 
 
 def _fmt_date(entry) -> str:
@@ -74,6 +105,36 @@ def _fmt_date(entry) -> str:
         return time.strftime("%Y-%m-%d", t)
     except Exception:
         return ""
+
+
+def _entry_best_summary(entry) -> str:
+    # Prefer full content when available (often richer for podcasts/newsletters)
+    content = getattr(entry, "content", None)
+    if isinstance(content, list) and content:
+        v = content[0].get("value")
+        if v:
+            return v
+
+    # Common RSS fields
+    for k in ["summary", "description", "subtitle"]:
+        v = getattr(entry, k, None)
+        if v:
+            return v
+
+    # Some parsers attach *_detail
+    sd = getattr(entry, "summary_detail", None) or {}
+    if isinstance(sd, dict) and sd.get("value"):
+        return sd["value"]
+
+    return ""
+
+
+def _summary_limit_for(feed_url: str) -> int:
+    d = _domain(feed_url)
+    # Podcasts + newsletters should be more informative.
+    if any(x in d for x in ["megaphone.fm", "buzzsprout.com", "substack.com", "alexfinn.ai"]):
+        return LONG_SUMMARY_CHARS
+    return DEFAULT_SUMMARY_CHARS
 
 
 def build_html(report_date: str, sections):
@@ -154,31 +215,36 @@ def main():
 
     for section_name, feed_list in FEEDS.items():
         out_feeds = []
-        for feed_name, feed_url in feed_list:
+        for feed_name, feed_urls in feed_list:
             items_out = []
+            parsed, used_url, err = _fetch_feed_with_fallback(feed_urls)
             try:
-                parsed = _fetch_feed(feed_url)
+                if parsed is None:
+                    raise err or Exception("Unknown feed error")
+
                 entries = getattr(parsed, "entries", []) or []
+                limit = _summary_limit_for(used_url or feed_urls[0])
+
                 for e in entries[:MAX_ITEMS_PER_FEED]:
                     title = getattr(e, "title", "") or ""
                     link = getattr(e, "link", "") or ""
                     date = _fmt_date(e)
 
-                    summary = getattr(e, "summary", "") or getattr(e, "description", "") or ""
-                    summary_txt = _clean_html_to_text(summary)
-                    if len(summary_txt) > 240:
-                        summary_txt = summary_txt[:237] + "..."
+                    summary_raw = _entry_best_summary(e)
+                    summary_txt = _clean_html_to_text(summary_raw)
+                    if len(summary_txt) > limit:
+                        summary_txt = summary_txt[: max(0, limit - 3)] + "..."
 
                     items_out.append(
                         {
                             "title": title.strip(),
                             "link": link.strip(),
                             "date": date,
-                            "source": _domain(link) or _domain(feed_url),
+                            "source": _domain(link) or _domain(used_url or feed_urls[0]),
                             "desc": summary_txt,
                         }
                     )
-            except Exception as ex:
+            except Exception:
                 items_out = []
 
             out_feeds.append((feed_name, items_out))
