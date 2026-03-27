@@ -4,7 +4,7 @@ import os
 import re
 import html
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 import requests
@@ -43,6 +43,7 @@ FEEDS = {
 USER_AGENT = "OpenClaw Daily AI Report (+local script)"
 TIMEOUT_S = 20
 MAX_ITEMS_PER_FEED = 6
+MAX_AGE_DAYS = 7
 
 # Default truncation for summaries. Some sources (podcasts/newsletters) benefit from longer text.
 DEFAULT_SUMMARY_CHARS = 240
@@ -96,15 +97,30 @@ def _fetch_feed_with_fallback(urls):
     return None, None, last_err
 
 
+def _entry_time_struct(entry):
+    return getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+
+
 def _fmt_date(entry) -> str:
-    # Prefer published_parsed then updated_parsed
-    t = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+    t = _entry_time_struct(entry)
     if not t:
         return ""
     try:
         return time.strftime("%Y-%m-%d", t)
     except Exception:
         return ""
+
+
+def _is_within_days(entry, days: int, now_ts: float) -> bool:
+    """Return True if entry has a parseable date and is within the last N days."""
+    t = _entry_time_struct(entry)
+    if not t:
+        return False
+    try:
+        entry_ts = time.mktime(t)
+    except Exception:
+        return False
+    return entry_ts >= (now_ts - days * 86400)
 
 
 def _entry_best_summary(entry) -> str:
@@ -209,6 +225,7 @@ def main():
     os.makedirs(REPORTS_DIR, exist_ok=True)
 
     now = datetime.now()
+    now_ts = now.timestamp()
     report_date = now.strftime("%Y-%m-%d")
 
     sections = {}
@@ -225,7 +242,11 @@ def main():
                 entries = getattr(parsed, "entries", []) or []
                 limit = _summary_limit_for(used_url or feed_urls[0])
 
-                for e in entries[:MAX_ITEMS_PER_FEED]:
+                for e in entries:
+                    # Enforce freshness
+                    if not _is_within_days(e, MAX_AGE_DAYS, now_ts):
+                        continue
+
                     title = getattr(e, "title", "") or ""
                     link = getattr(e, "link", "") or ""
                     date = _fmt_date(e)
@@ -244,6 +265,9 @@ def main():
                             "desc": summary_txt,
                         }
                     )
+
+                    if len(items_out) >= MAX_ITEMS_PER_FEED:
+                        break
             except Exception:
                 items_out = []
 
