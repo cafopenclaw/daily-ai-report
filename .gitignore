@@ -1,6 +1,5 @@
 # Generated outputs
-reports/
-latest.html
+site/
 cron.out.log
 cron.err.log
 __pycache__/

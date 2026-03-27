@@ -12,8 +12,10 @@ import feedparser
 from bs4 import BeautifulSoup
 
 WORKDIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-REPORTS_DIR = os.path.join(WORKDIR, "reports")
-LATEST_PATH = os.path.join(WORKDIR, "latest.html")
+SITE_DIR = os.path.join(WORKDIR, "site")
+REPORTS_DIR = os.path.join(SITE_DIR, "reports")
+INDEX_PATH = os.path.join(SITE_DIR, "index.html")
+LATEST_PATH = os.path.join(SITE_DIR, "latest.html")
 
 # --- Feeds ---
 # Keep these curated + mostly RSS to avoid brittle scraping.
@@ -142,6 +144,7 @@ def build_html(report_date: str, sections):
 
 
 def main():
+    os.makedirs(SITE_DIR, exist_ok=True)
     os.makedirs(REPORTS_DIR, exist_ok=True)
 
     now = datetime.now()
@@ -188,8 +191,10 @@ def main():
     with open(dated_path, "w", encoding="utf-8") as f:
         f.write(html_out)
 
-    # Update a stable link
+    # Update stable links
     with open(LATEST_PATH, "w", encoding="utf-8") as f:
+        f.write(html_out)
+    with open(INDEX_PATH, "w", encoding="utf-8") as f:
         f.write(html_out)
 
     print(dated_path)
